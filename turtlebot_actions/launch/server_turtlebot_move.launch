@@ -1,10 +1,8 @@
 <launch>
-  <!-- Keep things as accurate as possible, don't use a smoother -->
-  <!-- <include file="$(find turtlebot_actions)/launch/includes/velocity_smoother.launch.xml"/>  -->
-
-  <node pkg="turtlebot_actions" type="turtlebot_move_action_server" name="move_action_server">
-      <remap from="move_action_server/cmd_vel" to="cmd_vel_mux/input/navi"/>
-      <remap from="move_action_server/turtlebot_move" to="turtlebot_move"/>
+  <!-- Node name is turtlebot_move_action_server to match the initialization in code -->
+  <node pkg="turtlebot_actions" type="turtlebot_move_action_server" name="turtlebot_move_action_server">
+      <!-- Update remappings to match the node name and private namespace -->
+      <remap from="turtlebot_move_action_server/cmd_vel" to="cmd_vel_mux/input/navi"/>
+      <remap from="turtlebot_move_action_server/turtlebot_move" to="turtlebot_move"/>
   </node>
-
 </launch>

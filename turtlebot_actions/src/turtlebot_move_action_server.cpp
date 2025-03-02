@@ -1,32 +1,7 @@
 /*
  * Copyright (c) 2011, Willow Garage, Inc.
  * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in the
- *       documentation and/or other materials provided with the distribution.
- *     * Neither the name of the Willow Garage, Inc. nor the names of its
- *       contributors may be used to endorse or promote products derived from
- *       this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
  */
-
 
 #include <ros/ros.h>
 #include <std_msgs/Float32.h>
@@ -36,20 +11,23 @@
 #include <tf/transform_listener.h>
 #include <cmath>
 
+// Include Kobuki messages for hazard detection
+#include <kobuki_msgs/BumperEvent.h>
+#include <kobuki_msgs/CliffEvent.h>
+#include <kobuki_msgs/WheelDropEvent.h>
+
 class MoveActionServer
 {
 private:
-    
   ros::NodeHandle nh_;
   actionlib::SimpleActionServer<turtlebot_actions::TurtlebotMoveAction> as_;
   std::string action_name_;
 
-  turtlebot_actions::TurtlebotMoveFeedback     feedback_;
-  turtlebot_actions::TurtlebotMoveResult       result_;
+  turtlebot_actions::TurtlebotMoveFeedback feedback_;
+  turtlebot_actions::TurtlebotMoveResult result_;
   turtlebot_actions::TurtlebotMoveGoalConstPtr goal_;
   
-  ros::Subscriber       sub_;
-  ros::Publisher        cmd_vel_pub_;
+  ros::Publisher cmd_vel_pub_;
   tf::TransformListener listener_;
   
   // Parameters
@@ -57,6 +35,12 @@ private:
   std::string odom_frame;
   double turn_rate;
   double forward_rate;
+  
+  // Hazard detection flag and subscribers
+  bool hazard_detected_;
+  ros::Subscriber bumper_sub_;
+  ros::Subscriber cliff_sub_;
+  ros::Subscriber wheel_drop_sub_;
   
 public:
   MoveActionServer(const std::string name) : 
@@ -68,18 +52,33 @@ public:
     nh_.param<double>("turn_rate", turn_rate, 0.75);
     nh_.param<double>("forward_rate", forward_rate, 0.25);
     
-    //register the goal and feeback callbacks
+    // Initialize hazard flag
+    hazard_detected_ = false;
+    
+    // Register the goal and preempt callbacks
     as_.registerGoalCallback(boost::bind(&MoveActionServer::goalCB, this));
     as_.registerPreemptCallback(boost::bind(&MoveActionServer::preemptCB, this));
     
     as_.start();
     
     cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("cmd_vel", 1);
+
+    // Subscribe to hazard topics (using the default TurtleBot topic names)
+    bumper_sub_ = nh_.subscribe("/mobile_base/events/bumper", 10,
+                                &MoveActionServer::bumperCallback, this);
+    cliff_sub_ = nh_.subscribe("/mobile_base/events/cliff", 10,
+                               &MoveActionServer::cliffCallback, this);
+    wheel_drop_sub_ = nh_.subscribe("/mobile_base/events/wheel_drop", 10,
+                                    &MoveActionServer::wheelDropCallback, this);
   }
 
+  // Called when a new goal is received
   void goalCB()
   {
-    // accept the new goal
+    // Reset hazard flag for a new goal.
+    hazard_detected_ = false;
+
+    // Accept the new goal
     feedback_.forward_distance = 0.0;
     feedback_.turn_distance = 0.0;
     
@@ -100,43 +99,72 @@ public:
       as_.setAborted(result_);
   }
 
+  // Preempt callback
   void preemptCB()
   {
     ROS_INFO("%s: Preempted", action_name_.c_str());
-    // set the action state to preempted
+    // Publish a stop command
+    geometry_msgs::Twist stop_cmd;
+    stop_cmd.linear.x = 0.0;
+    stop_cmd.angular.z = 0.0;
+    cmd_vel_pub_.publish(stop_cmd);
     as_.setPreempted();
+  }
+
+  // Hazard callbacks
+  void bumperCallback(const kobuki_msgs::BumperEvent::ConstPtr& msg)
+  {
+    if (msg->state == kobuki_msgs::BumperEvent::PRESSED)
+    {
+      ROS_ERROR("Bumper pressed!");
+      hazard_detected_ = true;
+    }
+  }
+  
+  void cliffCallback(const kobuki_msgs::CliffEvent::ConstPtr& msg)
+  {
+    if (msg->state == kobuki_msgs::CliffEvent::CLIFF)
+    {
+      ROS_ERROR("Cliff detected!");
+      hazard_detected_ = true;
+    }
+  }
+  
+  void wheelDropCallback(const kobuki_msgs::WheelDropEvent::ConstPtr& msg)
+  {
+    if (msg->state == kobuki_msgs::WheelDropEvent::DROPPED)
+    {
+      ROS_ERROR("Wheel drop detected!");
+      hazard_detected_ = true;
+    }
   }
 
   bool driveForwardOdom(double distance)
   {
-    // If the distance to travel is negligble, don't even try.
+    // If the distance to travel is negligible, don't even try.
     if (fabs(distance) < 0.01)
       return true;
     
-    //we will record transforms here
     tf::StampedTransform start_transform;
     tf::StampedTransform current_transform;
   
     try
     {
-      //wait for the listener to get the first message
       listener_.waitForTransform(base_frame, odom_frame, 
                                  ros::Time::now(), ros::Duration(1.0));
       
-      //record the starting transform from the odometry to the base frame
       listener_.lookupTransform(base_frame, odom_frame, 
                                 ros::Time(0), start_transform);
     }
     catch (tf::TransformException ex)
     {
-      ROS_ERROR("%s",ex.what());
+      ROS_ERROR("%s", ex.what());
       return false;
     }
     
-    //we will be sending commands of type "twist"
     geometry_msgs::Twist base_cmd;
-    //the command will be to go forward at 0.25 m/s
-    base_cmd.linear.y = base_cmd.angular.z = 0;
+    base_cmd.linear.y = 0.0;
+    base_cmd.angular.z = 0.0;
     base_cmd.linear.x = forward_rate;
     
     if (distance < 0)
@@ -146,10 +174,37 @@ public:
     bool done = false;
     while (!done && nh_.ok() && as_.isActive())
     {
-      //send the drive command
+      // Process any incoming callbacks.
+      ros::spinOnce();
+
+      // Check for preemption
+      if (as_.isPreemptRequested())
+      {
+        ROS_INFO("%s: Preempt requested during driveForwardOdom, stopping.", action_name_.c_str());
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.linear.x = 0.0;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        as_.setPreempted();
+        return false;
+      }
+      
+      // Check for hazard
+      if (hazard_detected_)
+      {
+        ROS_ERROR("Hazard detected! Aborting drive forward.");
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.linear.x = 0.0;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        as_.setAborted(result_);
+        return false;
+      }
+
+      // Send the drive command
       cmd_vel_pub_.publish(base_cmd);
       rate.sleep(); 
-      //get the current transform
+      
       try
       {
         listener_.lookupTransform(base_frame, odom_frame, 
@@ -157,12 +212,11 @@ public:
       }
       catch (tf::TransformException ex)
       {
-        ROS_ERROR("%s",ex.what());
+        ROS_ERROR("%s", ex.what());
         break;
       }
-      //see how far we've traveled
-      tf::Transform relative_transform = 
-        start_transform.inverse() * current_transform;
+      // Calculate how far we've moved
+      tf::Transform relative_transform = start_transform.inverse() * current_transform;
       double dist_moved = relative_transform.getOrigin().length();
       
       // Update feedback and result.
@@ -170,67 +224,87 @@ public:
       result_.forward_distance = dist_moved;
       as_.publishFeedback(feedback_);
 
-      if(fabs(dist_moved) > fabs(distance))
+      if (fabs(dist_moved) > fabs(distance))
       {
         done = true;
       }
     }
+    // Publish a stop command after moving
     base_cmd.linear.x = 0.0;
     base_cmd.angular.z = 0.0;
     cmd_vel_pub_.publish(base_cmd);
 
-    if (done) return true;
-    return false;
+    return done;
   }
 
   bool turnOdom(double radians)
   {
-    // If the distance to travel is negligble, don't even try.
+    // If the angle is negligible, don't even try.
     if (fabs(radians) < 0.01)
       return true;
   
-    while(radians < -M_PI) radians += 2*M_PI;
-    while(radians > M_PI) radians -= 2*M_PI;
+    while(radians < -M_PI) radians += 2 * M_PI;
+    while(radians > M_PI) radians -= 2 * M_PI;
 
-    //we will record transforms here
     tf::StampedTransform start_transform;
     tf::StampedTransform current_transform;
 
     try
     {
-      //wait for the listener to get the first message
       listener_.waitForTransform(base_frame, odom_frame, 
                                  ros::Time::now(), ros::Duration(1.0));
 
-      //record the starting transform from the odometry to the base frame
       listener_.lookupTransform(base_frame, odom_frame, 
                                 ros::Time(0), start_transform);
     }
     catch (tf::TransformException ex)
     {
-      ROS_ERROR("%s",ex.what());
+      ROS_ERROR("%s", ex.what());
       return false;
     }
     
-    //we will be sending commands of type "twist"
     geometry_msgs::Twist base_cmd;
-    //the command will be to turn at 0.75 rad/s
-    base_cmd.linear.x = base_cmd.linear.y = 0.0;
+    base_cmd.linear.x = 0.0;
+    base_cmd.linear.y = 0.0;
     base_cmd.angular.z = turn_rate;
     if (radians < 0)
       base_cmd.angular.z = -turn_rate;
-    
-    //the axis we want to be rotating by
-    tf::Vector3 desired_turn_axis(0,0,1);
     
     ros::Rate rate(25.0);
     bool done = false;
     while (!done && nh_.ok() && as_.isActive())
     {
-      //send the drive command
+      // Process incoming callbacks.
+      ros::spinOnce();
+
+      // Check for preemption
+      if (as_.isPreemptRequested())
+      {
+        ROS_INFO("%s: Preempt requested during turnOdom, stopping.", action_name_.c_str());
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.linear.x = 0.0;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        as_.setPreempted();
+        return false;
+      }
+      
+      // Check for hazard
+      if (hazard_detected_)
+      {
+        ROS_ERROR("Hazard detected! Aborting turn.");
+        geometry_msgs::Twist stop_cmd;
+        stop_cmd.linear.x = 0.0;
+        stop_cmd.angular.z = 0.0;
+        cmd_vel_pub_.publish(stop_cmd);
+        as_.setAborted(result_);
+        return false;
+      }
+      
+      // Send the turn command
       cmd_vel_pub_.publish(base_cmd);
       rate.sleep();
-      //get the current transform
+
       try
       {
         listener_.lookupTransform(base_frame, odom_frame, 
@@ -238,13 +312,10 @@ public:
       }
       catch (tf::TransformException ex)
       {
-        ROS_ERROR("%s",ex.what());
+        ROS_ERROR("%s", ex.what());
         break;
       }
-      tf::Transform relative_transform = 
-        start_transform.inverse() * current_transform;
-      tf::Vector3 actual_turn_axis = 
-        relative_transform.getRotation().getAxis();
+      tf::Transform relative_transform = start_transform.inverse() * current_transform;
       double angle_turned = relative_transform.getRotation().getAngle();
       
       // Update feedback and result.
@@ -252,18 +323,16 @@ public:
       result_.turn_distance = angle_turned;
       as_.publishFeedback(feedback_);
       
-      if ( fabs(angle_turned) < 1.0e-2) continue;
-
-      //if ( actual_turn_axis.dot( desired_turn_axis ) < 0 ) 
-      //  angle_turned = 2 * M_PI - angle_turned;
-
-      if (fabs(angle_turned) > fabs(radians)) done = true;
+      if (fabs(angle_turned) > fabs(radians))
+        done = true;
     }
-    if (done) return true;
-    return false;
+    // Publish a stop command after turning
+    base_cmd.linear.x = 0.0;
+    base_cmd.angular.z = 0.0;
+    cmd_vel_pub_.publish(base_cmd);
+
+    return done;
   }
-
-
 };
 
 int main(int argc, char** argv)
@@ -275,4 +344,3 @@ int main(int argc, char** argv)
 
   return 0;
 }
-

@@ -1,43 +1,44 @@
 #!/usr/bin/env python
-import roslib
-roslib.load_manifest('turtlebot_actions')
 
 import rospy
-
-import os
-import sys
-import time
-import math
-from turtlebot_actions.msg import *
-from actionlib_msgs.msg import *
-
-
 import actionlib
+from turtlebot_actions.msg import TurtlebotMoveAction, TurtlebotMoveGoal, TurtlebotMoveFeedback, TurtlebotMoveResult
 
-'''
-  Very simple move action test - commands the robot to turn 45 degrees and travel 0.5 metres forward.
-'''
+def feedback_cb(feedback):
+    rospy.loginfo("Feedback - Forward: {:.2f} m, Turn: {:.2f} rad".format(feedback.forward_distance, feedback.turn_distance))
 
 def main():
-  rospy.init_node("test_move_action_client")
+    rospy.init_node("turtlebot_move_client")
 
-  # Construct action ac
-  rospy.loginfo("Starting action client...")
-  action_client = actionlib.SimpleActionClient('turtlebot_move', TurtlebotMoveAction)
-  action_client.wait_for_server()
-  rospy.loginfo("Action client connected to action server.")
+    # Create action client
+    client = actionlib.SimpleActionClient("turtlebot_move", TurtlebotMoveAction)
+    
+    rospy.loginfo("Waiting for action server to start...")
+    client.wait_for_server()
+    rospy.loginfo("Action server available!")
 
-  # Call the action
-  rospy.loginfo("Calling the action server...")
-  action_goal = TurtlebotMoveGoal()
-  action_goal.turn_distance = -math.pi/4.0
-  action_goal.forward_distance = 0.25 # metres
+    # Create goal
+    goal = TurtlebotMoveGoal()
+    goal.turn_distance = 3.14159 / 4  # 45 degrees in radians
+    goal.forward_distance = 0.5  # Move forward 0.5 meters
 
-  if action_client.send_goal_and_wait(action_goal, rospy.Duration(50.0), rospy.Duration(50.0)) == GoalStatus.SUCCEEDED:
-    rospy.loginfo('Call to action server succeeded')
-  else:
-    rospy.logerr('Call to action server failed')
+    rospy.loginfo("Sending goal: Turn {:.2f} rad, Move {:.2f} m".format(goal.turn_distance, goal.forward_distance))
+    
+    # Send goal with feedback callback
+    client.send_goal(goal, feedback_cb=feedback_cb)
 
+    # Wait for result
+    client.wait_for_result()
+    
+    # Get and print final result
+    result = client.get_result()
+    if result:
+        rospy.loginfo("Action completed! Final Forward: {:.2f} m, Final Turn: {:.2f} rad".format(result.forward_distance, result.turn_distance))
+    else:
+        rospy.logwarn("Action failed or was preempted.")
 
 if __name__ == "__main__":
-  main()
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
